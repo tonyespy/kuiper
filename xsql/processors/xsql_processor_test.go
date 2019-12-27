@@ -150,6 +150,7 @@ func dropStreams(t *testing.T) {
 
 func getMockSource(name string, done chan<- struct{}, size int) *nodes.SourceNode {
 	var data []*xsql.Tuple
+	delay := 50
 	switch name {
 	case "demo":
 		data = []*xsql.Tuple{
@@ -200,6 +201,7 @@ func getMockSource(name string, done chan<- struct{}, size int) *nodes.SourceNod
 			},
 		}
 	case "demo1":
+		delay = 51
 		data = []*xsql.Tuple{
 			{
 				Emitter: name,
@@ -208,7 +210,7 @@ func getMockSource(name string, done chan<- struct{}, size int) *nodes.SourceNod
 					"hum":  65,
 					"ts":   1541152486013,
 				},
-				Timestamp: 1541152486013,
+				Timestamp: 1541152486016,
 			},
 			{
 				Emitter: name,
@@ -217,7 +219,7 @@ func getMockSource(name string, done chan<- struct{}, size int) *nodes.SourceNod
 					"hum":  59,
 					"ts":   1541152486823,
 				},
-				Timestamp: 1541152486823,
+				Timestamp: 1541152486826,
 			},
 			{
 				Emitter: name,
@@ -226,7 +228,7 @@ func getMockSource(name string, done chan<- struct{}, size int) *nodes.SourceNod
 					"hum":  75,
 					"ts":   1541152487632,
 				},
-				Timestamp: 1541152487632,
+				Timestamp: 1541152487636,
 			},
 			{
 				Emitter: name,
@@ -235,7 +237,7 @@ func getMockSource(name string, done chan<- struct{}, size int) *nodes.SourceNod
 					"hum":  80,
 					"ts":   1541152488442,
 				},
-				Timestamp: 1541152488442,
+				Timestamp: 1541152488446,
 			},
 			{
 				Emitter: name,
@@ -244,7 +246,7 @@ func getMockSource(name string, done chan<- struct{}, size int) *nodes.SourceNod
 					"hum":  62,
 					"ts":   1541152489252,
 				},
-				Timestamp: 1541152489252,
+				Timestamp: 1541152489256,
 			},
 		}
 	case "sessionDemo":
@@ -350,7 +352,7 @@ func getMockSource(name string, done chan<- struct{}, size int) *nodes.SourceNod
 			},
 		}
 	}
-	return nodes.NewSourceNodeWithSource(name, test.NewMockSource(data[:size], done, false), map[string]string{
+	return nodes.NewSourceNodeWithSource(name, test.NewMockSource(data[:size], done, delay, false), map[string]string{
 		"DATASOURCE": name,
 	})
 }
@@ -1127,9 +1129,9 @@ func getEventMockSource(name string, done chan<- struct{}, size int) *nodes.Sour
 				Message: map[string]interface{}{
 					"color": "yellow",
 					"size":  4,
-					"ts":    1541152492342,
+					"ts":    1541152494342,
 				},
-				Timestamp: 1541152488442,
+				Timestamp: 1541152494342,
 			},
 		}
 	case "demo1E":
@@ -1301,7 +1303,7 @@ func getEventMockSource(name string, done chan<- struct{}, size int) *nodes.Sour
 			},
 		}
 	}
-	return nodes.NewSourceNodeWithSource(name, test.NewMockSource(data[:size], done, true), map[string]string{
+	return nodes.NewSourceNodeWithSource(name, test.NewMockSource(data[:size], done, 0, true), map[string]string{
 		"DATASOURCE": name,
 	})
 }

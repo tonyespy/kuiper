@@ -6,6 +6,7 @@ import (
 	"github.com/emqx/kuiper/common"
 	"github.com/emqx/kuiper/xsql"
 	"github.com/emqx/kuiper/xstream/api"
+	"github.com/emqx/kuiper/xstream/nodes"
 	"math"
 	"sort"
 	"time"
@@ -30,11 +31,12 @@ type WatermarkGenerator struct {
 	window          *WindowConfig
 	lateTolerance   int64
 	interval        int
+	length          int
 	ticker          common.Ticker
-	stream          chan<- interface{}
+	stream          chan<- *WatermarkTuple
 }
 
-func NewWatermarkGenerator(window *WindowConfig, l int64, s []string, stream chan<- interface{}) (*WatermarkGenerator, error) {
+func NewWatermarkGenerator(window *WindowConfig, l int64, s []string, stream chan<- *WatermarkTuple) (*WatermarkGenerator, error) {
 	w := &WatermarkGenerator{
 		window:        window,
 		topicToTs:     make(map[string]int64),
@@ -44,13 +46,13 @@ func NewWatermarkGenerator(window *WindowConfig, l int64, s []string, stream cha
 	}
 	//Tickers to update watermark
 	switch window.Type {
-	case xsql.NOT_WINDOW:
 	case xsql.TUMBLING_WINDOW:
 		w.ticker = common.GetTicker(window.Length)
 		w.interval = window.Length
 	case xsql.HOPPING_WINDOW:
 		w.ticker = common.GetTicker(window.Interval)
 		w.interval = window.Interval
+		w.length = window.Length
 	case xsql.SLIDING_WINDOW:
 		w.interval = window.Length
 	case xsql.SESSION_WINDOW:
@@ -63,21 +65,13 @@ func NewWatermarkGenerator(window *WindowConfig, l int64, s []string, stream cha
 	return w, nil
 }
 
-func (w *WatermarkGenerator) track(s string, ts int64, ctx api.StreamContext) bool {
+func (w *WatermarkGenerator) track(s string, ts int64, ctx api.StreamContext) {
 	log := ctx.GetLogger()
 	log.Infof("watermark generator track event from topic %s at %d", s, ts)
 	currentVal, ok := w.topicToTs[s]
 	if !ok || ts > currentVal {
 		w.topicToTs[s] = ts
 	}
-	r := ts >= w.lastWatermarkTs
-	if r {
-		switch w.window.Type {
-		case xsql.SLIDING_WINDOW:
-			w.trigger(ctx)
-		}
-	}
-	return r
 }
 
 func (w *WatermarkGenerator) start(ctx api.StreamContext) {
@@ -130,19 +124,28 @@ func (w *WatermarkGenerator) computeWatermarkTs(ctx context.Context) int64 {
 }
 
 //If window end cannot be determined yet, return max int64 so that it can be recalculated for the next watermark
-func (w *WatermarkGenerator) getNextWindow(inputs []*xsql.Tuple, current int64, watermark int64, triggered bool) int64 {
+func (w *WatermarkGenerator) getNextWindow(inputs []*xsql.Tuple, current int64, watermark int64) int64 {
 	switch w.window.Type {
-	case xsql.TUMBLING_WINDOW, xsql.HOPPING_WINDOW:
-		if triggered {
-			return current + int64(w.interval)
-		} else {
-			interval := int64(w.interval)
-			nextTs := getEarliestEventTs(inputs, current, watermark)
-			if nextTs == math.MaxInt64 || nextTs%interval == 0 {
-				return nextTs
-			}
-			return nextTs + (interval - nextTs%interval)
+	case xsql.TUMBLING_WINDOW:
+		interval := int64(w.interval)
+		common.Log.Infof("get earliest between %d and %d", current, watermark)
+		nextTs := getEarliestEventTs(inputs, current, watermark)
+		if nextTs == math.MaxInt64 || nextTs%interval == 0 {
+			return nextTs
 		}
+		return nextTs + (interval - nextTs%interval)
+	case xsql.HOPPING_WINDOW:
+		interval := int64(w.interval)
+		common.Log.Infof("get earliest between %d and %d", current, watermark)
+		nextTs := getEarliestEventTs(inputs, current - int64(w.length - w.interval), watermark)
+		if nextTs == math.MaxInt64 || nextTs%interval == 0 {
+			return nextTs
+		}
+		nextEnd := nextTs + (interval - nextTs%interval)
+		if nextEnd == current{
+			nextEnd += interval
+		}
+		return nextEnd
 	case xsql.SLIDING_WINDOW:
 		nextTs := getEarliestEventTs(inputs, current, watermark)
 		return nextTs
@@ -188,62 +191,77 @@ func (o *WindowOperator) execEventWindow(ctx api.StreamContext, errCh chan<- err
 	log := ctx.GetLogger()
 	go o.watermarkGenerator.start(exeCtx)
 	var (
-		inputs          []*xsql.Tuple
-		triggered       bool
 		nextWindowEndTs int64
 		prevWindowEndTs int64
+		incomplete    []int64
 	)
-
+	packs := make(map[int64][][]*xsql.Tuple)
 	for {
 		select {
-		// process incoming item
-		case item, opened := <-o.input:
-			o.statManager.ProcessTimeStart()
-			if !opened {
-				o.statManager.IncTotalExceptions()
-				break
+		case d := <- o.watermarkCh:
+			watermarkTs := d.GetTimestamp()
+			o.sync(WATERMARK, watermarkTs)
+			windowEndTs := nextWindowEndTs
+			//Get snapshot of inputs
+			var inputs []*xsql.Tuple
+			for _, worker := range o.workers{
+				inputs = append(inputs, worker.Inputs...)
 			}
-			if d, ok := item.(xsql.Event); !ok {
-				log.Errorf("Expect xsql.Event type")
-				o.statManager.IncTotalExceptions()
-				break
-			} else {
-				if d.IsWatermark() {
-					watermarkTs := d.GetTimestamp()
-					windowEndTs := nextWindowEndTs
-					//Session window needs a recalculation of window because its window end depends the inputs
-					if windowEndTs == math.MaxInt64 || o.window.Type == xsql.SESSION_WINDOW || o.window.Type == xsql.SLIDING_WINDOW {
-						windowEndTs = o.watermarkGenerator.getNextWindow(inputs, prevWindowEndTs, watermarkTs, triggered)
-					}
-					for windowEndTs <= watermarkTs && windowEndTs >= 0 {
-						log.Debugf("Window end ts %d Watermark ts %d", windowEndTs, watermarkTs)
-						log.Debugf("Current input count %d", len(inputs))
-						//scan all events and find out the event in the current window
-						inputs, triggered = o.scan(inputs, windowEndTs, ctx)
-						prevWindowEndTs = windowEndTs
-						windowEndTs = o.watermarkGenerator.getNextWindow(inputs, windowEndTs, watermarkTs, triggered)
-					}
-					nextWindowEndTs = windowEndTs
-					log.Debugf("next window end %d", nextWindowEndTs)
-				} else {
-					o.statManager.IncTotalRecordsIn()
-					tuple, ok := d.(*xsql.Tuple)
-					if !ok {
-						log.Infof("receive non tuple element %v", d)
-					}
-					log.Debugf("event window receive tuple %s", tuple.Message)
-					if o.watermarkGenerator.track(tuple.Emitter, d.GetTimestamp(), ctx) {
-						inputs = append(inputs, tuple)
+			//Session window needs a recalculation of window because its window end depends the inputs
+			if windowEndTs == math.MaxInt64 || o.window.Type == xsql.SESSION_WINDOW || o.window.Type == xsql.SLIDING_WINDOW {
+				windowEndTs = o.watermarkGenerator.getNextWindow(inputs, prevWindowEndTs, watermarkTs)
+			}
+			for windowEndTs <= watermarkTs && windowEndTs >= 0 {
+				log.Infof("Window end ts %d Watermark ts %d", windowEndTs, watermarkTs)
+				log.Infof("Current input count %d", len(inputs))
+				//scan all events and find out the event in the current window
+				o.sync(END, windowEndTs)
+				prevWindowEndTs = windowEndTs
+				windowEndTs = o.watermarkGenerator.getNextWindow(inputs, windowEndTs, watermarkTs)
+			}
+			nextWindowEndTs = windowEndTs
+			log.Infof("next window end %d", nextWindowEndTs)
+		case s := <-o.winSigCh:
+			switch s.signal{
+			case SYNC:
+				log.Infof("run sync at %d", s.triggerTime)
+				o.sync(END, s.triggerTime)
+			case TRACK:
+				o.watermarkGenerator.track(s.topic, s.triggerTime, ctx)
+				switch o.window.Type {
+				case xsql.SLIDING_WINDOW:
+					o.sync(END, s.triggerTime)
+				}
+			}
+		case pack := <- o.winCh:
+			//TODO treat concurrency one faster
+			if ps, ok := packs[pack.triggerTime]; !ok{
+				packs[pack.triggerTime] = [][]*xsql.Tuple{
+					pack.records,
+				}
+				i := sort.Search(len(incomplete), func(i int) bool { return incomplete[i] >= pack.triggerTime })
+				incomplete = append(incomplete, 0)
+				copy(incomplete[i+1:], incomplete[i:])
+				incomplete[i] = pack.triggerTime
+			}else{
+				packs[pack.triggerTime] = append(ps, pack.records)
+			}
+			for len(incomplete) > 0 && len(packs[incomplete[0]]) == o.concurrency{
+				key := incomplete[0]
+				var results xsql.WindowTuplesSet = make([]xsql.WindowTuples, 0)
+				for _, rs := range packs[key]{
+					for _, r := range rs {
+						results = results.AddTuple(r)
 					}
 				}
-				o.statManager.ProcessTimeEnd()
+				results.Sort()
+				nodes.Broadcast(o.outputs, results, ctx)
+				incomplete = incomplete[1:]
+				delete(packs, key)
 			}
 		// is cancelling
 		case <-ctx.Done():
 			log.Infoln("Cancelling window....")
-			if o.ticker != nil {
-				o.ticker.Stop()
-			}
 			cancel()
 			return
 		}

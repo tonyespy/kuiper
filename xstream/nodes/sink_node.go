@@ -100,6 +100,7 @@ func (m *SinkNode) Open(ctx api.StreamContext, result chan<- error) {
 				for {
 					select {
 					case item := <-m.input:
+						logger.Infof("sink node receive %s", item)
 						if runAsync{
 							go doCollect(sink, item, stats, ctx)
 						} else {

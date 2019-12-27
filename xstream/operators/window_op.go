@@ -6,7 +6,9 @@ import (
 	"github.com/emqx/kuiper/xsql"
 	"github.com/emqx/kuiper/xstream/api"
 	"github.com/emqx/kuiper/xstream/nodes"
-	"math"
+	"github.com/prometheus/common/log"
+	"sort"
+	"sync"
 	"time"
 )
 
@@ -16,17 +18,44 @@ type WindowConfig struct {
 	Interval int //If interval is not set, it is equals to Length
 }
 
+type signal int
+const (
+	SYNC signal = iota
+	SESSION
+	END
+	TIMEOUT
+	WATERMARK
+	TRACK
+)
+
+type scanSignal struct{
+	signal signal
+	triggerTime int64
+	topic	string
+}
+
+type windowPack struct {
+	records []*xsql.Tuple
+	triggerTime int64
+}
+
 type WindowOperator struct {
 	input              chan interface{}
+	watermarkCh        chan *WatermarkTuple
 	outputs            map[string]chan<- interface{}
 	name               string
 	ticker             common.Ticker //For processing time only
 	window             *WindowConfig
 	interval           int
-	triggerTime        int64
+	triggerTime		   int64
 	isEventTime        bool
-	statManager        *nodes.StatManager
 	watermarkGenerator *WatermarkGenerator //For event time only
+
+	concurrency        int
+	mutex       	   sync.RWMutex
+	winCh        	   chan *windowPack  //The channel to receive window results from workers
+	winSigCh	 	   chan *scanSignal  //The channel to receive signal from workers
+	workers            []*windowWorker
 }
 
 func NewWindowOp(name string, w *xsql.Window, isEventTime bool, lateTolerance int64, streams []string) (*WindowOperator, error) {
@@ -35,29 +64,28 @@ func NewWindowOp(name string, w *xsql.Window, isEventTime bool, lateTolerance in
 	o.input = make(chan interface{}, 1024)
 	o.outputs = make(map[string]chan<- interface{})
 	o.name = name
+	o.concurrency = 1
 	o.isEventTime = isEventTime
+	o.winCh  = make(chan *windowPack)
+	o.winSigCh = make(chan *scanSignal)
 	if w != nil {
 		o.window = &WindowConfig{
 			Type:     w.WindowType,
 			Length:   w.Length.Val,
 			Interval: w.Interval.Val,
 		}
-	} else {
-		o.window = &WindowConfig{
-			Type: xsql.NOT_WINDOW,
-		}
 	}
 
 	if isEventTime {
+		o.watermarkCh = make(chan *WatermarkTuple, 1024)
 		//Create watermark generator
-		if w, err := NewWatermarkGenerator(o.window, lateTolerance, streams, o.input); err != nil {
+		if w, err := NewWatermarkGenerator(o.window, lateTolerance, streams, o.watermarkCh); err != nil {
 			return nil, err
 		} else {
 			o.watermarkGenerator = w
 		}
 	} else {
 		switch o.window.Type {
-		case xsql.NOT_WINDOW:
 		case xsql.TUMBLING_WINDOW:
 			o.ticker = common.GetTicker(o.window.Length)
 			o.interval = o.window.Length
@@ -74,6 +102,13 @@ func NewWindowOp(name string, w *xsql.Window, isEventTime bool, lateTolerance in
 		}
 	}
 	return o, nil
+}
+
+func (o *WindowOperator) SetConcurrency(concurr int) {
+	o.concurrency = concurr
+	if o.concurrency < 1 {
+		o.concurrency = 1
+	}
 }
 
 func (o *WindowOperator) GetName() string {
@@ -97,19 +132,27 @@ func (o *WindowOperator) GetInput() (chan<- interface{}, string) {
 // input: *xsql.Tuple from preprocessor
 // output: xsql.WindowTuplesSet
 func (o *WindowOperator) Exec(ctx api.StreamContext, errCh chan<- error) {
-	log := ctx.GetLogger()
-	log.Infof("Window operator %s is started", o.name)
+	logger := ctx.GetLogger()
+	logger.Infof("Window operator %s is started", o.name)
 
 	if len(o.outputs) <= 0 {
 		go func() { errCh <- fmt.Errorf("no output channel found") }()
 		return
 	}
-	stats, err := nodes.NewStatManager("op", ctx)
-	if err != nil {
-		go func() { errCh <- err }()
-		return
+	if o.concurrency < 1 {
+		o.concurrency = 1
 	}
-	o.statManager = stats
+	logger.Debugf("Window operator %s is started with concurrency %d", o.name, o.concurrency)
+	//Starting thw workers
+	for i := 0; i < o.concurrency; i++ { // workers
+		w, err := newWindowWorker(o.window, o.input, o.winCh, o.winSigCh, o.isEventTime, ctx.WithInstance(i))
+		if err != nil {
+			go func() { errCh <- err }()
+			return
+		}
+		o.workers = append(o.workers, w)
+		go w.run()
+	}
 	if o.isEventTime {
 		go o.execEventWindow(ctx, errCh)
 	} else {
@@ -118,79 +161,93 @@ func (o *WindowOperator) Exec(ctx api.StreamContext, errCh chan<- error) {
 }
 
 func (o *WindowOperator) execProcessingWindow(ctx api.StreamContext, errCh chan<- error) {
-	log := ctx.GetLogger()
-	var (
-		inputs        []*xsql.Tuple
+	//create the op loop for issue time events and receive results
+	var(
 		c             <-chan time.Time
+		packs		  map[int64][][]*xsql.Tuple
+		incomplete    []int64
+		last		  int64
 		timeoutTicker common.Timer
 		timeout       <-chan time.Time
 	)
-
 	if o.ticker != nil {
 		c = o.ticker.GetC()
 	}
-
-	for {
-		select {
-		// process incoming item
-		case item, opened := <-o.input:
-			o.statManager.IncTotalRecordsIn()
-			o.statManager.ProcessTimeStart()
-			if !opened {
-				o.statManager.IncTotalExceptions()
-				break
+	packs = make(map[int64][][]*xsql.Tuple)
+	for{
+		select{
+		//receive window length event from tumble,hopping or session
+		case now := <-c:
+			n := common.TimeToUnixMilli(now)
+			log.Infof("receive tick %d", n)
+			//For session window, check if the last scan time is newer than the inputs
+			if o.window.Type == xsql.SESSION_WINDOW {
+				//scan time for session window will record all triggers of the ticker but not the timeout
+				lastTriggerTime := o.triggerTime
+				o.triggerTime = n
+				var minT int64 = -1
+				for _, w := range o.workers{
+					if len(w.Inputs) > 0 && (minT < 0 || minT > w.Inputs[0].Timestamp){
+						minT = w.Inputs[0].Timestamp
+					}
+				}
+				log.Infof("current minimum record %d and the lastTriggerTime %d", minT, lastTriggerTime)
+				//Check if the current window has exceeded the max duration, if not continue expand
+				if lastTriggerTime < minT {
+					break
+				}
 			}
-			if d, ok := item.(*xsql.Tuple); !ok {
-				log.Errorf("Expect xsql.Tuple type")
-				o.statManager.IncTotalExceptions()
-				break
-			} else {
-				log.Infof("Event window receive tuple %s", d.Message)
-				inputs = append(inputs, d)
-				switch o.window.Type {
-				case xsql.NOT_WINDOW:
-					inputs, _ = o.scan(inputs, d.Timestamp, ctx)
-				case xsql.SLIDING_WINDOW:
-					inputs, _ = o.scan(inputs, d.Timestamp, ctx)
-				case xsql.SESSION_WINDOW:
-					if timeoutTicker != nil {
+			log.Infof("triggered by ticker")
+			o.sync(END, n)
+		//From sliding window/session window
+		case s := <-o.winSigCh:
+			switch s.signal{
+			case SYNC:
+				log.Infof("run sync at %d", s.triggerTime)
+				o.sync(END, s.triggerTime)
+			case SESSION:
+				if timeoutTicker != nil {
+					if s.triggerTime > last{
 						timeoutTicker.Stop()
 						timeoutTicker.Reset(time.Duration(o.window.Interval) * time.Millisecond)
-					} else {
-						timeoutTicker = common.GetTimer(o.window.Interval)
-						timeout = timeoutTicker.GetC()
 					}
+				} else {
+					timeoutTicker = common.GetTimer(o.window.Interval)
+					timeout = timeoutTicker.GetC()
 				}
-			}
-			o.statManager.ProcessTimeEnd()
-		case now := <-c:
-			if len(inputs) > 0 {
-				o.statManager.ProcessTimeStart()
-				n := common.TimeToUnixMilli(now)
-				//For session window, check if the last scan time is newer than the inputs
-				if o.window.Type == xsql.SESSION_WINDOW {
-					//scan time for session window will record all triggers of the ticker but not the timeout
-					lastTriggerTime := o.triggerTime
-					o.triggerTime = n
-					//Check if the current window has exceeded the max duration, if not continue expand
-					if lastTriggerTime < inputs[0].Timestamp {
-						break
-					}
-				}
-				log.Infof("triggered by ticker")
-				inputs, _ = o.scan(inputs, n, ctx)
-				o.statManager.ProcessTimeEnd()
+				last = s.triggerTime
 			}
 		case now := <-timeout:
-			if len(inputs) > 0 {
-				o.statManager.ProcessTimeStart()
-				log.Infof("triggered by timeout")
-				inputs, _ = o.scan(inputs, common.TimeToUnixMilli(now), ctx)
-				//expire all inputs, so that when timer scan there is no item
-				inputs = make([]*xsql.Tuple, 0)
-				o.statManager.ProcessTimeEnd()
+			log.Infof("triggered by timeout")
+			o.sync(TIMEOUT, common.TimeToUnixMilli(now))
+		case pack := <- o.winCh:
+			//TODO treat concurrency one faster
+			if ps, ok := packs[pack.triggerTime]; !ok{
+				packs[pack.triggerTime] = [][]*xsql.Tuple{
+					pack.records,
+				}
+				i := sort.Search(len(incomplete), func(i int) bool { return incomplete[i] >= pack.triggerTime })
+				incomplete = append(incomplete, 0)
+				copy(incomplete[i+1:], incomplete[i:])
+				incomplete[i] = pack.triggerTime
+			}else{
+				packs[pack.triggerTime] = append(ps, pack.records)
 			}
-		// is cancelling
+			for len(incomplete) > 0 && len(packs[incomplete[0]]) == o.concurrency{
+				key := incomplete[0]
+				var results xsql.WindowTuplesSet = make([]xsql.WindowTuples, 0)
+				for _, rs := range packs[key]{
+					for _, r := range rs {
+						results = results.AddTuple(r)
+					}
+				}
+				//if o.concurrency > 1{
+				//	results.Sort()
+				//}
+				nodes.Broadcast(o.outputs, results, ctx)
+				incomplete = incomplete[1:]
+				delete(packs, key)
+			}
 		case <-ctx.Done():
 			log.Infoln("Cancelling window....")
 			if o.ticker != nil {
@@ -201,77 +258,23 @@ func (o *WindowOperator) execProcessingWindow(ctx api.StreamContext, errCh chan<
 	}
 }
 
-func (o *WindowOperator) scan(inputs []*xsql.Tuple, triggerTime int64, ctx api.StreamContext) ([]*xsql.Tuple, bool) {
-	log := ctx.GetLogger()
-	log.Infof("window %s triggered at %s", o.name, time.Unix(triggerTime/1000, triggerTime%1000))
-	var delta int64
-	if o.window.Type == xsql.HOPPING_WINDOW || o.window.Type == xsql.SLIDING_WINDOW {
-		delta = o.calDelta(triggerTime, delta, log)
+func (o *WindowOperator) sync(signal signal, triggerTime int64){
+	s := &scanSignal{
+		signal:      signal,
+		triggerTime: triggerTime,
 	}
-	var results xsql.WindowTuplesSet = make([]xsql.WindowTuples, 0)
-	i := 0
-	//Sync table
-	for _, tuple := range inputs {
-		if o.window.Type == xsql.HOPPING_WINDOW || o.window.Type == xsql.SLIDING_WINDOW {
-			diff := o.triggerTime - tuple.Timestamp
-			if diff > int64(o.window.Length)+delta {
-				log.Infof("diff: %d, length: %d, delta: %d", diff, o.window.Length, delta)
-				log.Infof("tuple %s emitted at %d expired", tuple, tuple.Timestamp)
-				//Expired tuple, remove it by not adding back to inputs
-				continue
-			}
-			//Added back all inputs for non expired events
-			inputs[i] = tuple
-			i++
-		} else if tuple.Timestamp > triggerTime {
-			//Only added back early arrived events
-			inputs[i] = tuple
-			i++
-		}
-		if tuple.Timestamp <= triggerTime {
-			results = results.AddTuple(tuple)
-		}
+	for _, w := range o.workers{
+		w.SigCh <- s
 	}
-	triggered := false
-	if len(results) > 0 {
-		log.Infof("window %s triggered for %d tuples", o.name, len(inputs))
-		if o.isEventTime {
-			results.Sort()
-		}
-		log.Infof("Sent: %v", results)
-		//blocking if one of the channel is full
-		nodes.Broadcast(o.outputs, results, ctx)
-		triggered = true
-		o.statManager.IncTotalRecordsOut()
-		log.Debugf("done scan")
-	}
-
-	return inputs[:i], triggered
-}
-
-func (o *WindowOperator) calDelta(triggerTime int64, delta int64, log api.Logger) int64 {
-	lastTriggerTime := o.triggerTime
-	o.triggerTime = triggerTime
-	if lastTriggerTime <= 0 {
-		delta = math.MaxInt16 //max int, all events for the initial window
-	} else {
-		if !o.isEventTime && o.window.Interval > 0 {
-			delta = o.triggerTime - lastTriggerTime - int64(o.window.Interval)
-			if delta > 100 {
-				log.Warnf("Possible long computation in window; Previous eviction time: %d, current eviction time: %d", lastTriggerTime, o.triggerTime)
-			}
-		} else {
-			delta = 0
-		}
-	}
-	return delta
 }
 
 func (o *WindowOperator) GetMetrics() map[string]interface{} {
-	if o.statManager != nil {
-		return o.statManager.GetMetrics()
-	} else {
-		return nil
+	result := make(map[string]interface{})
+	for _, w := range o.workers{
+		for k, v := range w.Stats.GetMetrics(){
+			result[k] = v
+		}
 	}
+	return result
 
 }
