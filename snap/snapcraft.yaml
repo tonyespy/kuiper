@@ -1,0 +1,100 @@
+name: kuiper
+base: core18
+type: app
+version: "0.3.1"
+summary: kuiper
+description: |
+  kuiper
+
+architectures:
+  - build-on: arm64
+  - build-on: amd64
+
+# for start-timeout, we need snapd 2.38
+# we need command-chain for the hooks too
+assumes: [snapd2.42, command-chain]
+
+grade: devel
+confinement: strict
+
+layout:
+  /etc/luarocks:
+    bind: $SNAP/etc/luarocks
+
+environment:
+  KuiperBaseKey: $SNAP_DATA/kuiper
+
+apps:
+  kuiper:
+    adapter: full
+    command: bin/kuiper-server
+    #daemon: simple
+    plugs: [network, network-bind]
+  kuiper-cli:
+    adapter: full
+    command: bin/kuiper-cli
+    plugs: [network, network-bind]
+
+parts:
+  go-build-helper:
+    plugin: dump
+    # see comment for static-packages part about specifying a source part here
+    source: snap/local/build-helpers
+    prime: [-*]
+
+  # for now, the go part contains all of the remote part's stanzas, thus making
+  # it not remote, because we need to specify GO111MODULE=off when we build go
+  # otherwise go will try to import all of the files from the top-level go.mod
+  # from edgex-go which at this point will fail
+  # eventually we would like these changes to be upstreamed but until then
+  # they live here. see also https://github.com/edgexfoundry/edgex-go/issues/1109
+  go:
+    plugin: nil
+    source: snap/local/build-helpers
+    override-build: |
+      # use dpkg architecture to figure out our target arch
+      # note - we specifically don't use arch
+      case "$(dpkg --print-architecture)" in
+        amd64)
+          FILE_NAME=go1.13.8.linux-amd64.tar.gz
+          FILE_HASH=0567734d558aef19112f2b2873caa0c600f1b4a5827930eb5a7f35235219e9d8
+          ;;
+        arm64)
+          FILE_NAME=go1.13.8.linux-arm64.tar.gz
+          FILE_HASH=b46c0235054d0eb69a295a2634aec8a11c7ae19b3dc53556a626b89dc1f8cdb0
+          ;;
+      esac
+      # download the archive, failing on ssl cert problems
+      curl https://dl.google.com/go/$FILE_NAME -O
+      echo "$FILE_HASH $FILE_NAME" > sha256
+      sha256sum -c sha256 | grep OK
+      tar -C $SNAPCRAFT_STAGE -xf go*.tar.gz --strip-components=1
+    prime:
+      - "-*"
+    after: [go-build-helper]
+    build-packages:
+      - zip
+      - pkg-config
+
+  kuiper:
+    after: [go]
+    source: https://github.com/emqx/kuiper.git
+    source-tag: 0.3.2
+    plugin: make
+    override-build: |
+      cd $SNAPCRAFT_PART_SRC
+      export BUILD_PATH=$SNAPCRAFT_PART_BUILD
+      export PACKAGES_PATH=$SNAPCRAFT_PART_INSTALL
+      make build_with_edgex
+      make real_pkg
+      cd $SNAPCRAFT_PART_INSTALL
+      tar -xvf kuiper*.tar.gz --strip-components=1
+      rm *.zip *.gz
+    organize:
+      bin/cli: bin/kuiper-cli
+      bin/server: bin/kuiper-server
+    stage:
+      - -etc/mqtt_source.yaml
+    stage-packages:
+      - libzmq3-dev
+

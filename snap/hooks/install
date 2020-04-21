@@ -1,0 +1,16 @@
+#!/bin/bash -ex
+
+# get the values of $SNAP_DATA and $SNAP using the current symlink instead of
+# the default behavior which has the revision hard-coded, which breaks after
+# a refresh
+SNAP_DATA_CURRENT=${SNAP_DATA/%$SNAP_REVISION/current}
+SNAP_CURRENT=${SNAP/%$SNAP_REVISION/current}
+
+if [ ! -f "$SNAP_DATA/kuiper/data" ]; then
+    mkdir -p "$SNAP_DATA/kuiper/data"
+    mkdir -p "$SNAP_DATA/kuiper/etc/sources"
+
+    cp "$SNAP/etc/"*.yaml "$SNAP_DATA/kuiper/etc"
+    cp "$SNAP/etc/sources/"*.yaml "$SNAP_DATA/kuiper/etc/sources"
+fi
+
